@@ -1,7 +1,9 @@
 import base64
 import binascii
 from functools import cached_property
+from ipaddress import ip_address, ip_network, IPv4Network, IPv6Network
 
+from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import generics
 from rest_framework.authentication import get_authorization_header
 from rest_framework.exceptions import NotFound, ValidationError
@@ -48,13 +50,22 @@ class DynDNS12UpdateView(generics.GenericAPIView):
                 }
             except KeyError:
                 continue
-            if len(params) > 1 and params & {"", "preserve"}:
-                raise ValidationError(
-                    detail=f'IP parameter "{param_key}" cannot have addresses and "preserve" at the same time.',
-                    code="inconsistent-parameter",
-                )
+            if len(params) > 1:
+                if params & {"", "preserve"}:
+                    raise ValidationError(
+                        detail=f'IP parameter "{param_key}" cannot have addresses and "preserve" at the same time.',
+                        code="inconsistent-parameter",
+                    )
+                if any("/" in param for param in params):
+                    raise ValidationError(
+                        detail=f'IP parameter "{param_key}" cannot use subnet notation with multiple addresses.',
+                        code="multiple-subnet",
+                    )
             if params:
-                return [] if "" in params else list(params)
+                params = list(params)
+                if len(params) == 1 and "/" in params[0]:
+                    params = self._subnet_update(param_key, params[0])
+                return [] if "" in params else params
 
         # Check remote IP address
         client_ip = self.request.META.get("REMOTE_ADDR")
@@ -63,6 +74,31 @@ class DynDNS12UpdateView(generics.GenericAPIView):
 
         # give up
         return []
+
+    def _subnet_update(self, param_key, subnet):
+        try:
+            subnet = ip_network(subnet, strict=False)
+        except ValueError as e:
+            raise ValidationError(
+                detail=f'IP parameter "{param_key}": {e}',
+                code="invalid-subnet",
+            )
+        type_ = {IPv4Network: "A", IPv6Network: "AAAA"}[type(subnet)]
+        try:
+            records = self.domain.rrset_set.get(
+                type=type_, subname=self.subname
+            ).records.all()
+        except ObjectDoesNotExist:
+            records = []
+        return [
+            str(
+                ip_address(
+                    int(ip_address(record.content)) & int(subnet.hostmask)
+                )  # suffix
+                + int(subnet.network_address)  # prefix
+            )
+            for record in records
+        ]
 
     @cached_property
     def qname(self):
